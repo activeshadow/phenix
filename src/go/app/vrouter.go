@@ -38,6 +38,17 @@ type IPSecConfig struct {
 	} `mapstructure:"ipsec"`
 }
 
+type DHCPConfig struct {
+	ListenAddr string `mapstructure:"listenAddress"`
+	Ranges     []struct {
+		LowAddr  string `mapstructure:"lowAddress"`
+		HighAddr string `mapstructure:"highAddress"`
+	} `mapstructure:"ranges"`
+	DefaultRoute string            `mapstructure:"defaultRoute"`
+	DNS          []string          `mapstructure:"dnsServers"`
+	Static       map[string]string `mapstructure:"staticAssignments"`
+}
+
 type Vrouter struct {
 	ipsecPresharedKeys map[string]string
 }
@@ -154,6 +165,16 @@ func (this *Vrouter) PreStart(ctx context.Context, exp *types.Experiment) error 
 }
 
 func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
+	var app ifaces.ScenarioApp
+
+	// check if experiment contains a scenario config for this app
+	for _, a := range exp.Apps() {
+		if a.Name() == "vrouter" {
+			app = a
+			break
+		}
+	}
+
 	for _, node := range exp.Spec.Topology().Nodes() {
 		if !strings.EqualFold(node.Type(), "router") && !strings.EqualFold(node.Type(), "firewall") {
 			continue
@@ -163,10 +184,7 @@ func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
 			continue
 		}
 
-		var (
-			commit bool
-			cmd    = mmcli.NewNamespacedCommand(exp.Metadata.Name)
-		)
+		cmd := mmcli.NewNamespacedCommand(exp.Metadata.Name)
 
 		for idx, iface := range node.Network().Interfaces() {
 			switch strings.ToLower(iface.Proto()) {
@@ -177,8 +195,6 @@ func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
 					if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 						return fmt.Errorf("configuring default gateway for router %s: %w", node.General().Hostname(), err)
 					}
-
-					commit = true
 				}
 
 				// We need to set the IP address for both static and OSPF interfaces, so we fallthrough here.
@@ -188,15 +204,11 @@ func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
 				if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 					return fmt.Errorf("configuring interface for router %s: %w", node.General().Hostname(), err)
 				}
-
-				commit = true
 			case "dhcp":
 				cmd.Command = fmt.Sprintf("router %s interface %d dhcp", node.General().Hostname(), idx)
 				if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 					return fmt.Errorf("configuring interface for router %s: %w", node.General().Hostname(), err)
 				}
-
-				commit = true
 			}
 		}
 
@@ -205,8 +217,6 @@ func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
 			if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 				return fmt.Errorf("configuring static route for router %s: %w", node.General().Hostname(), err)
 			}
-
-			commit = true
 		}
 
 		if node.Network().OSPF() != nil {
@@ -214,8 +224,6 @@ func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
 			if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 				return fmt.Errorf("configuring router ID for router %s: %w", node.General().Hostname(), err)
 			}
-
-			commit = true
 
 			for _, area := range node.Network().OSPF().Areas() {
 				for idx, iface := range node.Network().Interfaces() {
@@ -245,19 +253,78 @@ func (Vrouter) PostStart(ctx context.Context, exp *types.Experiment) error {
 							if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 								return fmt.Errorf("configuring OSPF area network for router %s: %w", node.General().Hostname(), err)
 							}
-
-							commit = true
 						}
 					}
 				}
 			}
 		}
 
-		if commit {
-			cmd.Command = fmt.Sprintf("router %s commit", node.General().Hostname())
-			if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
-				return fmt.Errorf("committing config for router %s: %w", node.General().Hostname(), err)
+		if app != nil {
+			for _, host := range app.Hosts() {
+				if host.Hostname() != node.General().Hostname() {
+					continue
+				}
+
+				md := host.Metadata()
+
+				if _, ok := md["dhcp"]; ok {
+					var dhcp []DHCPConfig
+
+					if err := mapstructure.Decode(md["dhcp"], &dhcp); err != nil {
+						return fmt.Errorf("decoding DHCP config: %w", err)
+					}
+
+					for _, d := range dhcp {
+						for _, r := range d.Ranges {
+							cmd.Command = fmt.Sprintf("router %s dhcp %s range %s %s", host.Hostname(), d.ListenAddr, r.LowAddr, r.HighAddr)
+							if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+								return fmt.Errorf("configuring DHCP range for router %s: %w", host.Hostname(), err)
+							}
+						}
+
+						if d.DefaultRoute != "" {
+							cmd.Command = fmt.Sprintf("router %s dhcp %s router %s", host.Hostname(), d.ListenAddr, d.DefaultRoute)
+							if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+								return fmt.Errorf("configuring DHCP default route for router %s: %w", host.Hostname(), err)
+							}
+						}
+
+						for _, ns := range d.DNS {
+							cmd.Command = fmt.Sprintf("router %s dhcp %s dns %s", host.Hostname(), d.ListenAddr, ns)
+							if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+								return fmt.Errorf("configuring DHCP DNS server for router %s: %w", host.Hostname(), err)
+							}
+						}
+
+						for mac, ip := range d.Static {
+							cmd.Command = fmt.Sprintf("router %s dhcp %s static %s %s", host.Hostname(), d.ListenAddr, mac, ip)
+							if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+								return fmt.Errorf("configuring DHCP static assignment for router %s: %w", host.Hostname(), err)
+							}
+						}
+					}
+				}
+
+				if _, ok := md["dns"]; ok {
+					var dns map[string]string
+
+					if err := mapstructure.Decode(md["dns"], &dns); err != nil {
+						return fmt.Errorf("decoding DNS config: %w", err)
+					}
+
+					for ip, name := range dns {
+						cmd.Command = fmt.Sprintf("router %s dns %s %s", host.Hostname(), ip, name)
+						if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+							return fmt.Errorf("configuring DNS mapping for router %s: %w", host.Hostname(), err)
+						}
+					}
+				}
 			}
+		}
+
+		cmd.Command = fmt.Sprintf("router %s commit", node.General().Hostname())
+		if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+			return fmt.Errorf("committing config for router %s: %w", node.General().Hostname(), err)
 		}
 	}
 
