@@ -1,6 +1,9 @@
 package mm
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type Option func(*options)
 
@@ -115,22 +118,37 @@ func ScreenshotSize(s string) Option {
 
 type C2Option func(*c2Options)
 
+type C2ResponseType string
+
+const (
+	C2ResponseBoth   C2ResponseType = ""
+	C2ResponseStdout C2ResponseType = "stdout"
+	C2ResponseStderr C2ResponseType = "stderr"
+)
+
 type c2Options struct {
+	ctx context.Context
+
 	ns string
 	vm string
 
 	command   string
 	commandID string
 
+	sendFile string
+
 	timeout time.Duration
+	wait    bool
 
 	skipActiveClientCheck bool
+
+	responseType C2ResponseType
 }
 
 func NewC2Options(opts ...C2Option) c2Options {
 	o := c2Options{
-		// Default timeout to 5m if user doesn't set it.
-		timeout: 5 * time.Minute,
+		ctx:     context.Background(),
+		timeout: 5 * time.Minute, // default to 5m if not set
 	}
 
 	for _, opt := range opts {
@@ -138,6 +156,12 @@ func NewC2Options(opts ...C2Option) c2Options {
 	}
 
 	return o
+}
+
+func C2Context(c context.Context) C2Option {
+	return func(o *c2Options) {
+		o.ctx = c
+	}
 }
 
 func C2NS(n string) C2Option {
@@ -164,14 +188,38 @@ func C2CommandID(i string) C2Option {
 	}
 }
 
+func C2SendFile(f string) C2Option {
+	return func(o *c2Options) {
+		o.sendFile = f
+	}
+}
+
 func C2Timeout(d time.Duration) C2Option {
 	return func(o *c2Options) {
 		o.timeout = d
 	}
 }
 
+func C2Wait() C2Option {
+	return func(o *c2Options) {
+		o.wait = true
+	}
+}
+
 func C2SkipActiveClientCheck(s bool) C2Option {
 	return func(o *c2Options) {
 		o.skipActiveClientCheck = s
+	}
+}
+
+func C2ResponseTypeStdout() C2Option {
+	return func(o *c2Options) {
+		o.responseType = C2ResponseStdout
+	}
+}
+
+func C2ResponseTypeStderr() C2Option {
+	return func(o *c2Options) {
+		o.responseType = C2ResponseStderr
 	}
 }
